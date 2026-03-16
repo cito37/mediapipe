@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 隔空手势绘图系统</title>
+    <!-- 引入 MediaPipe -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; font-family: sans-serif; }
+        #container { position: relative; width: 100vw; height: 100vh; }
+        
+        /* 视频层：水平翻转以获得镜像体验 */
+        #input_video { 
+            position: absolute; width: 100%; height: 100%; object-fit: cover; 
+            transform: scaleX(-1); 
+            z-index: 0;
+        }
+        
+        /* 绘图层 */
+        #output_canvas { 
+            position: absolute; width: 100%; height: 100%; 
+            transform: scaleX(-1); /* 画布也翻转，以匹配视频 */
+            z-index: 1;
+        }
+
+        /* 状态提示 */
+        #status {
+            position: absolute; top: 10px; left: 10px; color: white; 
+            background: rgba(0,0,0,0.5); padding: 10px; border-radius: 5px; z-index: 10;
+            pointer-events: none;
+        }
+        
+        /* 加载遮罩 */
+        #loading {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: #000; color: #fff; display: flex; justify-content: center;
+            align-items: center; z-index: 20; font-size: 24px;
+        }
+    </style>
+</head>
+<body>
+
+<div id="container">
+    <video id="input_video" autoplay playsinline muted></video>
+    <canvas id="output_canvas"></canvas>
+    <div id="status">正在初始化...</div>
+    <div id="loading">正在加载模型，请稍候...<br>请允许摄像头权限</div>
+</div>
+
+<script>
+    // --- 1. 初始化变量 ---
+    const videoElement = document.getElementById('input_video');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const statusDiv = document.getElementById('status');
+    const loadingDiv = document.getElementById('loading');
+
+    // 状态管理
+    let isUiOpen = false;
+    let lastUiToggleTime = 0; // 防止频繁切换
+    const UI_COOLDOWN = 1500; // ms
+
+    // 绘图工具状态
+    let toolType = 'pen'; // 'pen' or 'eraser'
+    let strokeColor = '#0000FF';
+    let strokeSize = 8;
+    
+    // 数据存储
+    let strokes = []; // 存储所有笔画: [{points: [{x,y},...], color, size, isEraser}]
+    let currentStroke = null;
+    let particles = []; // 消散效果的粒子
+
+    // 缩放逻辑
+    let isScaling = false;
+    let initialPinchDistance = 0;
+    let initialScaleCenter = {x: 0, y: 0};
+    
+    // UI 按钮配置
+    const buttons = [
+        { id: 'pen', label: '画笔', x: 50, y: 50, w: 100, h: 60, color: '#ddd', action: () => { toolType = 'pen'; } },
+        { id: 'eraser', label: '橡皮擦', x: 50, y: 120, w: 100, h: 60, color: '#ddd', action: () => { toolType = 'eraser'; } },
+        
+        { id: 'c_red', label: '', x: 200, y: 50, w: 60, h: 60, color: '#FF0000', action: () => { strokeColor = '#FF0000'; toolType = 'pen'; } },
+        { id: 'c_green', label: '', x: 270, y: 50, w: 60, h: 60, color: '#00FF00', action: () => { strokeColor = '#00FF00'; toolType = 'pen'; } },
+        { id: 'c_blue', label: '', x: 340, y: 50, w: 60, h: 60, color: '#0000FF', action: () => { strokeColor = '#0000FF'; toolType = 'pen'; } },
+        
+        { id: 's_small', label: '细', x: 200, y: 120, w: 60, h: 60, color: '#888', action: () => { strokeSize = 3; } },
+        { id: 's_med', label: '中', x: 270, y: 120, w: 60, h: 60, color: '#888', action: () => { strokeSize = 8; } },
+        { id: 's_large', label: '粗', x: 340, y: 120, w: 60, h: 60, color: '#888', action: () => { strokeSize = 15; } },
+    ];
+
+    // 设置画布尺寸
+    function resizeCanvas() {
+        canvasElement.width = window.innerWidth;
+        canvasElement.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // --- 2. 辅助函数 ---
+
+    // 计算两点距离
+    function getDistance(p1, p2) {
+        return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+    }
+
+    // 将归一化坐标(0-1)转换为像素坐标
+    function toPixelCoords(point) {
+        return { x: point.x * canvasElement.width, y: point.y * canvasElement.height };
+    }
+
+    // --- 3. 手势识别逻辑 ---
+
+    // 检测食指是否伸出，其他手指弯曲 (用于点击 UI)
+    function isIndexPointing(landmarks) {
+        // console.log(landmarks)
+
+        const fingerTips = [8]; // 食指尖
+        const fingerPips = [6]; // 食指关节
+        const otherTips = [12, 16, 20]; // 中指、无名指、小指
+        const otherPips = [10, 14, 18];
+
+        // 食指伸直
+        if (landmarks[8].y > landmarks[6].y) return false; // 简单的Y轴判断，倒置坐标系要注意，这里假设手向上
+        
+        // 更稳定的判断：Tip 到 Wrist 的距离 > PIP 到 Wrist
+        const wrist = landmarks[0];
+        if (getDistance(landmarks[8], wrist) < getDistance(landmarks[6], wrist)) return false;
+
+        // 其他手指弯曲
+        for (let i = 0; i < otherTips.length; i++) {
+            if (getDistance(landmarks[otherTips[i]], wrist) > getDistance(landmarks[otherPips[i]], wrist)) return false;
+        }
+        return true;
+    }
+
+    // 检测捏合 (食指尖 + 拇指尖)
+    function isPinch(landmarks) {
+        const dist = getDistance(landmarks[8], landmarks[4]);
+        return dist < 0.5; // 阈值，根据需要调整
+    }
+
+    // 检测张开手掌 (5指伸开)
+    function isOpenPalm(landmarks) {
+        const tips = [4, 8, 12, 16, 20];
+        const pips = [2, 6, 10, 14, 18];
+        const wrist = landmarks[0];
+        
+        let extendedCount = 0;
+        for (let i = 0; i < tips.length; i++) {
+            // 简单判断：指尖离手腕比关节离手腕远
+            if (getDistance(landmarks[tips[i]], wrist) > getDistance(landmarks[pips[i]], wrist) * 1.2) {
+                extendedCount++;
+            }
+        }
+        return extendedCount === 5;
+    }
+
+    // 检测剪刀手/V字 (食指+中指伸开，其他弯曲) - 触发消散
+    function isVictory(landmarks) {
+        const tips = [8, 12];
+        const pips = [6, 10];
+        const closedTips = [16, 20]; // 无名指，小指
+        const closedPips = [14, 18];
+        const wrist = landmarks[0];
+
+        // 食指中指伸直
+        if (getDistance(landmarks[8], wrist) < getDistance(landmarks[6], wrist)) return false;
+        if (getDistance(landmarks[12], wrist) < getDistance(landmarks[10], wrist)) return false;
+
+        // 无名指小指弯曲
+        if (getDistance(landmarks[16], wrist) > getDistance(landmarks[14], wrist)) return false;
+        if (getDistance(landmarks[20], wrist) > getDistance(landmarks[18], wrist)) return false;
+        
+        // 拇指通常不作为核心判断，避免误判
+        return true;
+    }
+
+    // --- 4. 粒子系统 (消散效果) ---
+    class Particle {
+        constructor(x, y, color, size) {
+            this.x = x;
+            this.y = y;
+            this.color = color;
+            this.size = size;
+            this.vx = (Math.random() - 0.5) * 4;
+            this.vy = (Math.random() * 2) + 1; // 向下飘
+            this.life = 1.0;
+            this.decay = Math.random() * 0.02 + 0.005;
+        }
+        update() {
+            this.x += this.vx;
+            this.y += this.vy;
+            this.vx += (Math.random() - 0.5) * 0.5; // 飘动
+            this.life -= this.decay;
+        }
+        draw(ctx) {
+            ctx.globalAlpha = this.life;
+            ctx.fillStyle = this.color;
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.globalAlpha = 1.0;
+        }
+    }
+
+    function createParticlesFromStrokes() {
+        if (strokes.length === 0) return;
+        
+        // 采样点转换成粒子·
+        strokes.forEach(stroke => {
+            // 减少粒子数量以保证性能，每隔几个点取一个
+            for (let i = 0; i < stroke.points.length; i += 3) {
+                const p = stroke.points[i];
+                if(Math.random() > 0.5) {
+                    particles.push(new Particle(p.x, p.y, stroke.isEraser ? '#000' : stroke.color, stroke.size));
+                }
+            } 
+        });
+        strokes = []; // 清空笔画
+    }
+
+
+    // --- 5. MediaPipe 处理核心 ---
+    
+    function onResults(results) {
+        // 0. 准备画布
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        
+        // 1. 绘制历史笔画
+        strokes.forEach(stroke => {
+            canvasCtx.beginPath();
+            canvasCtx.lineWidth = stroke.size;
+            canvasCtx.lineCap = 'round';
+            canvasCtx.lineJoin = 'round';
+            if (stroke.isEraser) {
+                canvasCtx.globalCompositeOperation = 'destination-out'; // 橡皮擦效果
+                canvasCtx.strokeStyle = 'rgba(0,0,0,1)';
+            } else {
+                canvasCtx.globalCompositeOperation = 'source-over';
+                canvasCtx.strokeStyle = stroke.color;
+            }
+            
+            if (stroke.points.length > 0) {
+                canvasCtx.moveTo(stroke.points[0].x, stroke.points[0].y);
+                for (let i = 1; i < stroke.points.length; i++) {
+                    canvasCtx.lineTo(stroke.points[i].x, stroke.points[i].y);
+                }
+            }
+            canvasCtx.stroke();
+        });
+        canvasCtx.globalCompositeOperation = 'source-over'; // 重置
+
+        // 2. 粒子动画
+        if (particles.length > 0) {
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.update();
+                p.draw(canvasCtx);
+                if (p.life <= 0) particles.splice(i, 1);
+            }
+        }
+
+        // 3. 处理手势
+        const now = Date.now();
+        let statusText = "检测中...";
+        
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            // 绘制手部骨架 (为了调试和反馈)
+            for (const landmarks of results.multiHandLandmarks) {
+                drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 1});
+                drawLandmarks(canvasCtx, landmarks, {color: '#FF0000', lineWidth: 1, radius: 3});
+            }
+
+            const hand1 = results.multiHandLandmarks[0];
+            const hand2 = results.multiHandLandmarks.length > 1 ? results.multiHandLandmarks[1] : null;
+
+            // --- 逻辑 A: 检测手掌开关 UI ---
+            // 检查任一只手是否张开
+            let palmDetected = isOpenPalm(hand1) || (hand2 && isOpenPalm(hand2));
+            
+            if (palmDetected) {
+                if (now - lastUiToggleTime > UI_COOLDOWN) {
+                    isUiOpen = !isUiOpen;
+                    lastUiToggleTime = now;
+                }
+                statusText = isUiOpen ? "UI 已打开: 请用食指选择" : "UI 已关闭";
+            }
+
+            // --- 逻辑 B: UI 交互 (仅当 UI 打开且单手食指) ---
+            if (isUiOpen) {
+                // 绘制 UI
+                buttons.forEach(btn => {
+                    canvasCtx.fillStyle = btn.color;
+                    // 简单的边框表示选中状态
+                    if( (btn.id === 'pen' && toolType === 'pen') || 
+                        (btn.id === 'eraser' && toolType === 'eraser') ||
+                        (btn.action.toString().includes(strokeColor) && btn.id.startsWith('c_')) || 
+                        (btn.action.toString().includes(strokeSize) && btn.id.startsWith('s_'))) {
+                        canvasCtx.strokeStyle = "yellow";
+                        canvasCtx.lineWidth = 5;
+                        canvasCtx.strokeRect(btn.x, btn.y, btn.w, btn.h);
+                    }
+                    
+                    canvasCtx.fillRect(btn.x, btn.y, btn.w, btn.h);
+                    canvasCtx.fillStyle = "#000";
+                    canvasCtx.font = "16px Arial";
+                    if(btn.label) canvasCtx.fillText(btn.label, btn.x + 10, btn.y + 35);
+                });
+
+                // 检测食指点击
+                const indexTip = hand1[8];
+                const pixelTip = toPixelCoords(indexTip);
+                
+                // 绘制光标
+                canvasCtx.beginPath();
+                canvasCtx.arc(pixelTip.x, pixelTip.y, 5, 0, 2*Math.PI);
+                canvasCtx.fillStyle = "white";
+                canvasCtx.fill();
+
+                if (isIndexPointing(hand1)) {
+                    buttons.forEach(btn => {
+                        if (pixelTip.x >= btn.x && pixelTip.x <= btn.x + btn.w &&
+                            pixelTip.y >= btn.y && pixelTip.y <= btn.y + btn.h) {
+                                btn.action();
+                        }
+                    });
+                }
+            } 
+            // --- 逻辑 C: 绘图与操作 (UI 关闭时) ---
+            else {
+                // C1: 缩放 (双手食指)
+                if (hand1 && hand2) { // 需要双手
+                    // 简化判断：只要检测到两只手都存在，我们假设用户意图可能是缩放，
+                    // 这里为了精确，最好检测两只手是不是都在用食指指
+                    const h1Idx = toPixelCoords(hand1[8]);
+                    const h2Idx = toPixelCoords(hand2[8]);
+                    const dist = Math.hypot(h1Idx.x - h2Idx.x, h1Idx.y - h2Idx.y);
+
+                    if (!isScaling) {
+                        isScaling = true;
+                        initialPinchDistance = dist;
+                        // 记录缩放中心
+                        initialScaleCenter = { x: (h1Idx.x + h2Idx.x)/2, y: (h1Idx.y + h2Idx.y)/2 };
+                    } else {
+                        // 计算缩放比例
+                        const scaleFactor = dist / initialPinchDistance;
+                        // 简单的阈值防止抖动
+                        if (Math.abs(scaleFactor - 1) > 0.02) {
+                            // 对所有笔画应用缩放
+                            // 注意：这里的缩放非常简略，基于当前帧的增量会更平滑，
+                            // 但为了单文件简单，我们直接修改所有点的坐标相对于中心
+                            const ratio = scaleFactor; // 实际上应该累积，这里简化为每帧微调
+                            
+                            // 这里采用一种“每帧微调”策略：
+                            // 如果距离变大，整体放大一点点
+                            const zoomSpeed = 0.05;
+                            const zoomDir = scaleFactor > 1 ? (1 + zoomSpeed) : (1 - zoomSpeed);
+
+                            strokes.forEach(s => {
+                                s.size *= zoomDir;
+                                s.points.forEach(p => {
+                                    p.x = initialScaleCenter.x + (p.x - initialScaleCenter.x) * zoomDir;
+                                    p.y = initialScaleCenter.y + (p.y - initialScaleCenter.y) * zoomDir;
+                                });
+                            });
+                            // 重置基准防止指数爆炸
+                            initialPinchDistance = dist; 
+                            statusText = scaleFactor > 1 ? "放大中..." : "缩小中...";
+                        }
+                    }
+                } else {
+                    isScaling = false;
+
+                    // C2: 消散 (单手剪刀手 V)
+                    if (isVictory(hand1)) {
+                        statusText = "正在消散...";
+                        createParticlesFromStrokes();
+                    }
+                    // C3: 写字 (捏合)
+                    else if (isPinch(hand1)) {
+                        statusText = toolType === 'pen' ? "正在书写" : "正在擦除";
+                        const tip = toPixelCoords(hand1[8]); // 使用食指尖作为笔触
+                        // 平滑处理：简单的取中点或贝塞尔曲线可以在这里添加，这里直接连线
+                        
+                        if (!currentStroke) {
+                            currentStroke = {
+                                color: strokeColor,
+                                size: strokeSize,
+                                isEraser: toolType === 'eraser',
+                                points: []
+                            };
+                            strokes.push(currentStroke);
+                        }
+                        currentStroke.points.push({x: tip.x, y: tip.y});
+                    } else {
+                        // 抬笔
+                        currentStroke = null;
+                        statusText = "待机：捏合手指写字";
+                    }
+                }
+            }
+        }
+
+        statusDiv.innerText = statusText;
+        canvasCtx.restore();
+    }
+
+    // --- 6. MediaPipe 配置 ---
+    const hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({image: videoElement});
+        },
+        width: 1280,
+        height: 720
+    });
+
+    camera.start()
+        .then(() => {
+            loadingDiv.style.display = 'none';
+        })
+        .catch(err => {
+            loadingDiv.innerHTML = "摄像头启动失败: " + err;
+        });
+
+</script>
+</body>
+</html>
